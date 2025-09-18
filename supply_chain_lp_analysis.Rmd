@@ -1,0 +1,278 @@
+---
+title: "Supply Chain LP Optimization"
+author: "Enomaen Akhigbe"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+# Overview
+
+This report formulates and solves a simple per-SKU linear program (LP) to minimize **total unit cost** (manufacturing + shipping) subject to **feasible production bounds**.  
+For each SKU, the lower bound is set by meeting demand after accounting for the defect rate, and the upper bound is the production capacity.
+
+> **Assumptions**
+>
+> - A data frame named `supply_chain_data` exists in the environment **or** you will replace the data-loading chunk with your own source (e.g., CSV).
+> - If the dataset lacks an `SKU` column, a sequential `SKU` index is created.
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(lpSolve)
+library(dplyr)
+library(ggplot2)
+
+# Optional: Inspect available functions in lpSolve
+ls("package:lpSolve")
+```
+
+# Data
+
+Replace this section with your own data-loading step if needed. If `supply_chain_data` is already in your workspace, this chunk will simply copy it.
+
+```{r data-loading}
+# Example: If you have a CSV, uncomment and update the path
+# supply_chain_data <- read.csv("path/to/your/supply_chain_data.csv", stringsAsFactors = FALSE)
+
+# Copy to working object
+sc_data <- supply_chain_data
+
+# Create an SKU column if missing
+if (!"SKU" %in% colnames(sc_data)) {
+  sc_data <- sc_data %>% mutate(SKU = dplyr::row_number())
+}
+
+# Quick look at the data
+head(sc_data)
+
+# View() does not render inside knitted documents; use head() above.
+# View(sc_data)
+```
+
+## Basic Quality Checks
+
+```{r qc}
+# Count missing values by column
+colSums(is.na(sc_data))
+
+# Check for duplicate rows
+duplicated_rows <- sc_data[duplicated(sc_data), ]
+duplicated_rows
+```
+
+# Data Preparation
+
+```{r prep}
+# Standardize column names used by the model
+sc_data <- sc_data %>%
+  rename(
+    ManufacturingCost = `Manufacturing costs`,
+    ShippingCost = `Shipping costs`,
+    Demand = `Number of products sold`,
+    DefectRate = `Defect rates`,
+    ProductionVolume = `Production volumes`
+  )
+
+# Convert necessary columns to appropriate data types
+sc_data <- sc_data %>%
+  mutate(
+    ManufacturingCost = as.numeric(ManufacturingCost),
+    ShippingCost = as.numeric(ShippingCost),
+    Demand = as.integer(Demand),
+    DefectRate = as.numeric(DefectRate),
+    ProductionVolume = as.integer(ProductionVolume)
+  )
+
+# Structure & preview
+str(sc_data)
+head(sc_data)
+```
+
+# Model Formulation
+
+We minimize total unit cost per SKU:
+\[
+\min_x \sum_i (\text{ManufacturingCost}_i + \text{ShippingCost}_i)\, x_i
+\]
+subject to:
+- Lower bound: \( x_i \geq \dfrac{\text{Demand}_i}{1 - \text{DefectRate}_i} \)
+- Upper bound: \( x_i \leq \text{ProductionVolume}_i \)
+
+```{r model-formulation}
+n_skus <- nrow(sc_data)
+
+# Objective coefficients
+obj_fn <- sc_data$ManufacturingCost + sc_data$ShippingCost
+
+# Bounds
+lb <- sc_data$Demand / (1 - sc_data$DefectRate)
+ub <- sc_data$ProductionVolume
+
+# Build constraint matrices for bounds
+lower_constraints <- diag(n_skus)
+lower_rhs <- lb
+lower_dir <- rep(">=", n_skus)
+
+upper_constraints <- diag(n_skus)
+upper_rhs <- ub
+upper_dir <- rep("<=", n_skus)
+
+# Combine constraints
+constraints_matrix <- rbind(lower_constraints, upper_constraints)
+constraints_rhs <- c(lower_rhs, upper_rhs)
+constraints_dir <- c(lower_dir, upper_dir)
+```
+
+# Solve LP (Initial Attempt)
+
+```{r solve-initial}
+model <- lp(
+  direction = "min",
+  objective.in = obj_fn,
+  const.mat = constraints_matrix,
+  const.dir = constraints_dir,
+  const.rhs = constraints_rhs
+)
+
+if (model$status == 0) {
+  cat("✅ Optimal solution found (initial run).\n")
+  # Print first few for brevity
+  head(model$solution)
+} else {
+  cat("❌ No optimal solution found on the first attempt.\n")
+}
+```
+
+## Feasibility Diagnostics
+
+```{r feasibility}
+bounds_check <- data.frame(
+  SKU = sc_data$SKU,
+  LowerBound = lb,
+  UpperBound = ub,
+  Feasible = lb <= ub
+)
+head(bounds_check)
+
+# Indices of feasible SKUs
+feasible_indices <- which(bounds_check$Feasible)
+length(feasible_indices)
+```
+
+# Solve LP on Feasible Subset
+
+If the full problem is infeasible due to bound conflicts on some SKUs, we solve for the feasible subset and set the remaining SKUs to zero production.
+
+```{r solve-feasible}
+# Filter vectors to feasible SKUs
+obj_fn_feas <- obj_fn[feasible_indices]
+lb_feas <- lb[feasible_indices]
+ub_feas <- ub[feasible_indices]
+n_feas <- length(feasible_indices)
+
+# Rebuild constraints for feasible subset
+lower_constraints_feas <- diag(n_feas)
+upper_constraints_feas <- diag(n_feas)
+constraints_matrix_feas <- rbind(lower_constraints_feas, upper_constraints_feas)
+constraints_rhs_feas <- c(lb_feas, ub_feas)
+constraints_dir_feas <- c(rep(">=", n_feas), rep("<=", n_feas))
+
+# Solve LP on feasible subset
+model_feas <- lp(
+  direction = "min",
+  objective.in = obj_fn_feas,
+  const.mat = constraints_matrix_feas,
+  const.dir = constraints_dir_feas,
+  const.rhs = constraints_rhs_feas
+)
+
+if (model_feas$status == 0) {
+  cat("✅ Optimal solution found on feasible subset.\n")
+  head(model_feas$solution)
+} else {
+  cat("❌ No optimal solution found on feasible subset.\n")
+}
+```
+
+# Attach Solution to Data
+
+```{r attach-solution}
+# Initialize with zeros
+OptimalProduction <- rep(0, nrow(sc_data))
+
+# Assign LP solution to feasible indices
+if (exists("model_feas") && model_feas$status == 0) {
+  OptimalProduction[feasible_indices] <- model_feas$solution
+} else if (exists("model") && model$status == 0) {
+  # If the full model solved
+  OptimalProduction <- model$solution
+}
+
+sc_data$OptimalProduction <- OptimalProduction
+summary(sc_data$OptimalProduction)
+```
+
+# Visualization
+
+```{r viz-hist, fig.width=7, fig.height=5}
+ggplot(sc_data, aes(x = OptimalProduction)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black") +
+  labs(
+    title = "Distribution of Optimal Production Quantities",
+    x = "Optimal Production",
+    y = "Count of SKUs"
+  ) +
+  theme_minimal()
+```
+
+```{r viz-scatter, fig.width=7, fig.height=5}
+ggplot(sc_data, aes(x = Demand, y = OptimalProduction)) +
+  geom_point(color = "darkgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  labs(
+    title = "Optimal Production vs Demand",
+    x = "Demand",
+    y = "Optimal Production"
+  ) +
+  theme_minimal()
+```
+
+```{r viz-top-skus, fig.width=8, fig.height=5}
+sc_nonzero <- subset(sc_data, OptimalProduction > 0)
+
+# Ensure SKU is a factor for ordering
+sc_nonzero$SKU <- factor(sc_nonzero$SKU, levels = sc_nonzero$SKU[order(-sc_nonzero$OptimalProduction)])
+
+ggplot(sc_nonzero, aes(x = SKU, y = OptimalProduction)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "SKUs with Non-Zero Optimal Production", x = "SKU", y = "Optimal Production") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5))
+```
+
+# Top SKUs (By Optimal Production)
+
+```{r top-skus}
+sc_data %>%
+  filter(OptimalProduction > 0) %>%
+  arrange(desc(OptimalProduction)) %>%
+  dplyr::select(SKU, OptimalProduction, ManufacturingCost, ShippingCost) %>%
+  head(10)
+```
+
+# Total Cost
+
+```{r total-cost}
+# Choose the matching objective vector depending on which model solved
+objective_used <- if (exists("model_feas") && model_feas$status == 0) obj_fn[feasible_indices] else obj_fn
+solution_used <- if (exists("model_feas") && model_feas$status == 0) model_feas$solution else if (exists("model")) model$solution else rep(0, length(objective_used))
+
+total_cost <- sum(solution_used * objective_used, na.rm = TRUE)
+total_cost
+```
+
+
